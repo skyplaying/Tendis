@@ -273,6 +273,7 @@ class RocksKVStore : public KVStore {
                       const std::string* begin,
                       const std::string* end) final;
   Status fullCompact() final;
+  // RocksDB::DestroyDB
   Status clear() final;
   bool isRunning() const final;
   Status stop() final;
@@ -356,6 +357,8 @@ class RocksKVStore : public KVStore {
   Status recoveryFromBgError() override;
   void resetStatistics();
   Status setOption(const std::string& option, int64_t value) override;
+  Status setCompactOnDeletionCollectorFactory(
+    const std::string& option, const std::string& value) override;
   int64_t getOption(const std::string& option) override;
 
   Expected<VersionMeta> getVersionMeta() override;
@@ -471,6 +474,7 @@ class RocksKVStore : public KVStore {
   std::map<std::string, std::string> _rocksIntProperties;
   std::map<std::string, std::string> _rocksStringProperties;
   std::vector<rocksdb::ColumnFamilyHandle*> _cfHandles;
+  std::vector<rocksdb::ColumnFamilyDescriptor> _cfDescs;
 };
 
 class RocksdbEnv {

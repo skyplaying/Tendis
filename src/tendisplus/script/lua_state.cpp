@@ -676,6 +676,7 @@ LuaState::LuaState(std::shared_ptr<ServerEntry> svr, uint32_t id)
   : _id(id), _svr(std::move(svr)) {
   _lua = initLua(1);
   _scriptMgr = _svr->getScriptMgr();
+  _gc_count = 0;
 }
 
 LuaState::~LuaState() {
@@ -903,8 +904,7 @@ Expected<std::string> LuaState::luaReplyToRedisReply(lua_State *lua) {
         string ok = lua_tostring(lua, -1);
         redis_port::strmapchars(ok, "\r\n", "  ", 2);
         lua_pop(lua, 2);
-        // return Command::fmtBulk("+" + ok + "\r\n");
-        return Command::fmtBulk(ok);
+        return "+" + ok + "\r\n";
       } else {
         // void *replylen = addDeferredMultiBulkLength(c);
         int j = 1, mbulklen = 0;
@@ -1157,6 +1157,12 @@ Expected<std::string> LuaState::evalGenericCommand(Session *sess,
     //  DLOG(INFO) << "has_command_error txns don't commit.";
     // }
   // }
+
+  _gc_count++;
+  if (_gc_count == LUA_GC_CYCLE_PERIOD) {
+    lua_gc(_lua, LUA_GCSTEP, LUA_GC_CYCLE_PERIOD);
+    _gc_count = 0;
+  }
 
   if (err) {
     string errInfo = "Error running script (call to " + string(funcname) + "):"

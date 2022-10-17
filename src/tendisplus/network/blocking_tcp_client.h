@@ -38,6 +38,7 @@ class BlockingTcpClient
   Status tryWaitConnect();
   Expected<std::string> readLine(std::chrono::seconds timeout);
   Expected<std::string> read(size_t bufSize, std::chrono::seconds timeout);
+  Status read(char* buff, size_t bufSize, std::chrono::seconds timeout);
   Status writeLine(const std::string& line);
   Status writeOneBatch(const char* data,
                        uint32_t size,
@@ -71,14 +72,29 @@ class BlockingTcpClient
     }
   }
 
-  std::string getLocalRepr() const {
-    if (_socket.is_open()) {
-      std::stringstream ss;
-      ss << _socket.local_endpoint().address().to_string() << ":"
-         << _socket.local_endpoint().port();
-      return ss.str();
+  std::string getLocalIp() const {
+    try {
+      if (_socket.is_open()) {
+        return _socket.local_endpoint().address().to_string();
+      }
+      return "closed conn";
+    }  catch (const std::exception& e) {
+      return e.what();
     }
-    return "closed conn";
+  }
+
+  std::string getLocalRepr() const {
+    try {
+      if (_socket.is_open()) {
+        std::stringstream ss;
+        ss << _socket.local_endpoint().address().to_string() << ":"
+          << _socket.local_endpoint().port();
+        return ss.str();
+      }
+      return "closed conn";
+    } catch (const std::exception& e) {
+      return e.what();
+    }
   }
 
   size_t getReadBufSize() const {

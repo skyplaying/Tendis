@@ -30,6 +30,8 @@
 #include "rocksdb/perf_context.h"
 #include "rocksdb/statistics.h"
 #include "rocksdb/convenience.h"
+#include "rocksdb/table_properties.h"
+#include "rocksdb/utilities/table_properties_collectors.h"
 
 #include "tendisplus/storage/rocks/rocks_kvstore.h"
 #include "tendisplus/storage/rocks/rocks_kvttlcompactfilter.h"
@@ -1629,6 +1631,21 @@ Status RocksKVStore::clear() {
   if (_isRunning) {
     return {ErrorCodes::ERR_INTERNAL, "should stop before clear"};
   }
+  // We use rocksdb::DestroyDB to destroy the contents of the specified
+  // database, because 'User' may config these path:DBOptions::db_paths,
+  // DBOptions::db_log_dir, DBOptions::wal_dir, ColumnFamilyOptions::cf_paths.
+  // Using rocksdb::DestroyDB is simple. But when 'data path' has other
+  // files(not rocksdb generate), rocksdb::DestroyDB couldn't delete 'data path'
+  // , so we remove 'data path' again
+#if ROCKSDB_MAJOR > 5 || (ROCKSDB_MAJOR == 5 && ROCKSDB_MINOR > 15)
+  auto s = rocksdb::DestroyDB(dbName(), options(), _cfDescs);
+#else
+  auto s = rocksdb::DestroyDB(dbName(), options());
+#endif
+  if (!s.ok()) {
+    return handleRocksdbError(s);
+  }
+
   try {
     const std::string path = dbPath() + "/" + dbId();
     if (!filesystem::exists(path)) {
@@ -1640,19 +1657,16 @@ Status RocksKVStore::clear() {
     LOG(WARNING) << "dbId:" << dbId() << " clear failed:" << ex.what();
     return {ErrorCodes::ERR_INTERNAL, ex.what()};
   }
+
   return {ErrorCodes::ERR_OK, ""};
 }
 
 Expected<uint64_t> RocksKVStore::flush(Session* sess, uint64_t nextBinlogid) {
   auto s = stop();
-  if (!s.ok()) {
-    return s;
-  }
+  RET_IF_ERR(s);
 
   s = clear();
-  if (!s.ok()) {
-    return s;
-  }
+  RET_IF_ERR(s);
 
   auto ret = restart(false, nextBinlogid);
   if (!ret.ok()) {
@@ -1735,15 +1749,37 @@ Expected<uint64_t> RocksKVStore::restart(bool restore,
       return {ErrorCodes::ERR_INTERNAL, ex.what()};
     }
 
-    rocksdb::Options columOpts = options();
+    rocksdb::Options defaultColumnFamilyOpts = options();
+    // enable CompactOnDeletionCollectorFactory:
+#if ROCKSDB_MAJOR > 6 || (ROCKSDB_MAJOR == 6 && ROCKSDB_MINOR > 11)
+    defaultColumnFamilyOpts.table_properties_collector_factories.emplace_back(
+      rocksdb::NewCompactOnDeletionCollectorFactory(
+        _cfg->rocksCompactOnDeletionWindow,
+        _cfg->rocksCompactOnDeletionTrigger,
+        _cfg->rocksCompactOnDeletionRatio));
+#else
+    if (_cfg->rocksCompactOnDeletionWindow == 0) {
+      // disable CompactOnDeletionCollectorFactory
+    } else {
+      defaultColumnFamilyOpts.table_properties_collector_factories.emplace_back(
+        rocksdb::NewCompactOnDeletionCollectorFactory(
+          _cfg->rocksCompactOnDeletionWindow,
+          _cfg->rocksCompactOnDeletionTrigger));
+    }
+#endif
     std::unique_ptr<rocksdb::Iterator> iter = nullptr;
     std::unique_ptr<rocksdb::Iterator> binlog_iter = nullptr;
-    std::vector<rocksdb::ColumnFamilyDescriptor> column_families;
-    column_families.push_back(rocksdb::ColumnFamilyDescriptor(
-      rocksdb::kDefaultColumnFamilyName, columOpts));
+    // In clear() we use _cfDescs, so we don't put _cfDescs.clear() in
+    // RocksKVStore::stop(). stop() is used in these conditions:
+    // 1) flush/destroy: stop -> clear -> restart
+    // 2) recoveryFromBgError: stop -> restart
+    _cfDescs.clear();
+    _cfDescs.push_back(rocksdb::ColumnFamilyDescriptor(
+      rocksdb::kDefaultColumnFamilyName, defaultColumnFamilyOpts));
     if (!_cfg->binlogUsingDefaultCF) {
-      column_families.push_back(
-        rocksdb::ColumnFamilyDescriptor("binlog_cf", columOpts));
+      rocksdb::Options binlogColumnFamilyOpts = options();
+      _cfDescs.push_back(
+        rocksdb::ColumnFamilyDescriptor("binlog_cf", binlogColumnFamilyOpts));
     }
     if (_txnMode == TxnMode::TXN_OPT) {
       rocksdb::OptimisticTransactionDB* tmpDb = nullptr;
@@ -1752,7 +1788,7 @@ Expected<uint64_t> RocksKVStore::restart(bool restore,
       auto status = rocksdb::OptimisticTransactionDB::Open(
         dbOpts,
         dbname,
-        column_families,
+        _cfDescs,
         &_cfHandles,
         &tmpDb);  // open two column_family in OptimisticTranDB
       if (!status.ok()) {
@@ -1783,7 +1819,7 @@ Expected<uint64_t> RocksKVStore::restart(bool restore,
       LOG(INFO) << "rocksdb Open,id:" << dbId() << " dbname:" << dbname;
       // open two colum_family in pessimisticTranDB
       auto status = rocksdb::TransactionDB::Open(
-        dbOpts, txnDbOptions, dbname, column_families, &_cfHandles, &tmpDb);
+        dbOpts, txnDbOptions, dbname, _cfDescs, &_cfHandles, &tmpDb);
       if (!status.ok()) {
         LOG(INFO) << "rocksdb Open error,id:" << dbId() << " dbname:" << dbname;
         if (tmpDb) {
@@ -2752,11 +2788,11 @@ Status RocksKVStore::recoveryFromBgError() {
 Status RocksKVStore::setOption(const std::string& option, int64_t value) {
   std::unordered_map<std::string, std::string> map;
   if (option.substr(0, 6) != "rocks.") {
-    return {ErrorCodes::ERR_INTERNAL, option + "is not rocksdb option"};
+    return {ErrorCodes::ERR_INTERNAL, option + " is not rocksdb option"};
   }
 
   static std::set<std::string> rocksdb_dynamic_options = {
-    "rocks.max_background_compactions", "rocks.max_open_files"};
+    "rocks.max_background_jobs", "rocks.max_open_files"};
 
   if (rocksdb_dynamic_options.count(option) <= 0) {
     return {ErrorCodes::ERR_INTERNAL, option + " can't change dynamically"};
@@ -2773,9 +2809,71 @@ Status RocksKVStore::setOption(const std::string& option, int64_t value) {
   return {ErrorCodes::ERR_OK, ""};
 }
 
+Status RocksKVStore::setCompactOnDeletionCollectorFactory(
+  const std::string& option, const std::string& value) {
+  if (option.substr(0, 25) != "rocks.compaction_deletes_") {
+    return {ErrorCodes::ERR_INTERNAL, option + " is not rocksdb option"};
+  }
+
+#if ROCKSDB_MAJOR > 6 || (ROCKSDB_MAJOR == 6 && ROCKSDB_MINOR > 11)
+  auto table_properties_collector_factories =
+    getBaseDB()->GetOptions().table_properties_collector_factories;
+  std::string errinfo;
+  for (auto factory : table_properties_collector_factories) {
+    if (std::string(factory->Name()) == "CompactOnDeletionCollector") {
+      auto table_factory_option = option.substr(25, option.size() - 25);
+      auto compactOnDel =
+        static_cast<rocksdb::CompactOnDeletionCollectorFactory*>(factory.get());
+      if (table_factory_option == "window") {
+        auto ed = tendisplus::stoul(value);
+        if (!ed.ok()) {
+          errinfo = "invalid CompactOnDeletionCollector window value:" + value +
+            " " + ed.status().toString();
+          return {ErrorCodes::ERR_PARSEOPT, errinfo};
+        }
+
+        compactOnDel->SetWindowSize(ed.value());
+        return {ErrorCodes::ERR_OK, ""};
+      } else if (table_factory_option == "trigger") {
+        auto ed = tendisplus::stoul(value);
+        if (!ed.ok()) {
+          errinfo =
+            "invalid CompactOnDeletionCollector trigger value:" + value + " " +
+            ed.status().toString();
+          return {ErrorCodes::ERR_PARSEOPT, errinfo};
+        }
+
+        compactOnDel->SetDeletionTrigger(ed.value());
+        return {ErrorCodes::ERR_OK, ""};
+      } else if (table_factory_option == "ratio") {
+        auto ed = tendisplus::stod(value);
+        if (!ed.ok()) {
+          errinfo = "invalid CompactOnDeletionCollector ratio value:" + value +
+            " " + ed.status().toString();
+          return {ErrorCodes::ERR_PARSEOPT, errinfo};
+        }
+
+        compactOnDel->SetDeletionRatio(ed.value());
+        return {ErrorCodes::ERR_OK, ""};
+      } else {
+        return {ErrorCodes::ERR_INTERNAL,
+                option +
+                  " is not rocksdb-CompactOnDeletionTableFactory option"};
+      }
+    }
+  }
+
+  return {ErrorCodes::ERR_INTERNAL,
+          "Options don't contain CompactOnDeletionTableFactory"};
+#else
+  return {ErrorCodes::ERR_INTERNAL,
+          option + " can't be changed dynmaically in rocksdb(version < 6.11)"};
+#endif
+}
+
 int64_t RocksKVStore::getOption(const std::string& option) {
-  if (option == "rocks.max_background_compactions") {
-    return getBaseDB()->GetDBOptions().max_background_compactions;
+  if (option == "rocks.max_background_jobs") {
+    return getBaseDB()->GetDBOptions().max_background_jobs;
   } else if (option == "rocks.max_open_files") {
     return getBaseDB()->GetDBOptions().max_open_files;
   } else {

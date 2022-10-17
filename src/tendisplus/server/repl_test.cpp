@@ -219,6 +219,9 @@ TEST(Repl, Common) {
     std::this_thread::sleep_for(std::chrono::seconds(genRand() % 10 + 5));
     auto slave2 = makeAnotherSlave(slave2_dir, i, slave2_port, master_port);
 
+    // check direct IO
+    slave2->getParams()->directIo = true;
+
     LOG(INFO) << "waiting thd1 to exited";
     running = false;
     thd0.join();
@@ -253,6 +256,58 @@ TEST(Repl, Common) {
     ASSERT_EQ(slave_slave.use_count(), 1);
     ASSERT_EQ(slave1.use_count(), 1);
     ASSERT_EQ(slave2.use_count(), 1);
+#endif
+
+    LOG(INFO) << ">>>>>> test store count:" << i << " end;";
+  }
+}
+
+TEST(Repl, KVTtlCompactionFilter) {
+#ifdef _WIN32
+  size_t i = 0;
+  {
+#else
+  for (size_t i = 0; i < 1; i++) {
+#endif
+    LOG(INFO) << ">>>>>> test store count:" << i;
+    const auto guard = MakeGuard([] {
+      destroyReplEnv();
+      destroyEnv(slave1_dir);
+      std::this_thread::sleep_for(std::chrono::seconds(5));
+    });
+
+    auto hosts = makeReplEnv(i);
+
+    auto& master = hosts.first;
+    auto& slave = hosts.second;
+
+    // make sure slaveof is ok
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+
+    testExpireForNotExpired(master);
+    sleep(2);
+
+    auto slave1 = makeAnotherSlave(slave1_dir, i, slave1_port, master_port);
+    waitSlaveCatchup(master, slave1);
+    sleep(2);
+    runCommand(slave1,
+               {"compactrange", "default", "0", "16383"});
+
+    sleep(2);
+
+    for (auto& store : slave1->getStores()) {
+      ASSERT_EQ(store->stat.compactKvExpiredCount, 0);
+    }
+    compareData(master, slave1);
+
+#ifndef _WIN32
+    master->stop();
+    slave->stop();
+    slave1->stop();
+
+    ASSERT_EQ(slave.use_count(), 1);
+    ASSERT_EQ(master.use_count(), 1);
+    ASSERT_EQ(slave1.use_count(), 1);
 #endif
 
     LOG(INFO) << ">>>>>> test store count:" << i << " end;";

@@ -32,7 +32,7 @@ void testCommandArrayResult(
   asio::ip::tcp::socket socket(ioContext), socket1(ioContext);
   NetSession sess(svr, std::move(socket), 1, false, nullptr, nullptr);
 
-  for (auto& p : arr) {
+  for (const auto& p : arr) {
     sess.setArgs(p.first);
     auto expect = Command::runSessionCmd(&sess);
     if (expect.ok()) {
@@ -738,6 +738,47 @@ TEST(ClusterMsg, CommonUpdate) {
     EXPECT_EQ(uSlots, updatePtr->getSlots());
     EXPECT_EQ(uName, updatePtr->getNodeName());
   }
+}
+
+TEST(ClusterState, clusterReplyMultiBulkSlotsV2) {
+  uint32_t startPort = 16000;
+  auto server = makeClusterNode("node", startPort, 10);
+  auto clusterState = server->getClusterMgr()->getClusterState();
+  server->getClusterMgr()->stop();
+  int num = 128, bucket = 16384/num;
+
+  for (int i = 0; i < num; ++i) {
+    auto name = getUUid(20);
+    auto node = std::make_shared<ClusterNode>(
+      name,
+      CLUSTER_NODE_MASTER | CLUSTER_NODE_MEET | CLUSTER_NODE_HANDSHAKE,
+      clusterState,
+      "127.0.0.1",
+      i + startPort,
+      i + startPort);
+
+    for (int j = 0; j < bucket; ++j) {
+      int slot = i * bucket + j;
+      ASSERT_EQ(clusterState->clusterAddSlot(node, slot), true);
+    }
+    clusterState->clusterAddNode(node, false);
+  }
+
+  auto s1 = clusterState->clusterReplyMultiBulkSlots().value();
+  auto s2 = clusterState->clusterReplyMultiBulkSlotsV2().value();
+
+  auto start = msSinceEpoch();
+  for (int i = 0; i < 100; ++i) {
+    clusterState->clusterReplyMultiBulkSlots();
+  }
+  auto t1 = msSinceEpoch();
+  for (int i = 0; i < 100; ++i) {
+    clusterState->clusterReplyMultiBulkSlotsV2();
+  }
+  auto t2 = msSinceEpoch();
+  LOG(INFO) << "clusterReplyMultiBulkSlots time cost: " << (t1 - start)
+            << " clusterReplyMultiBulkSlotsV2 time cost: " << (t2 - t1)
+            << std::endl;
 }
 
 // check meet
@@ -2846,6 +2887,7 @@ TEST(Cluster, ManualfailoverCheck) {
   servers.clear();
 }
 
+
 TEST(Cluster, lockConfict) {
   uint32_t nodeNum = 3;
   uint32_t startPort = 15300;
@@ -2896,27 +2938,201 @@ TEST(Cluster, CrossSlot) {
   auto server = servers[0];
   std::this_thread::sleep_for(std::chrono::seconds(10));
 
+  // key : slot : node
+  // {1}   9842   s2
+  // {2}   5649   s1
+  // {3}   1584   s1
+  // {4}   14039  s2
+
+  std::string slotMovedReply("-MOVED 9842 127.0.0.1:15001\r\n");
+  std::string slotMovedReply1("-MOVED 14039 127.0.0.1:15001\r\n");
+  std::string crossSlotReply(
+    "-CROSSSLOT Keys in request don't hash to the same slot\r\n");
+
+  // not allow cross slot cases
   std::vector<std::pair<std::vector<std::string>, std::string>> resultArr = {
-    {{"set", "a{1}", "b"}, "-MOVED 9842 127.0.0.1:15001\r\n"},
-    {{"mset", "a{1}", "b", "c{2}", "d"},
-     "-CROSSSLOT Keys in request don't hash to the same slot\r\n"},
-    {{"mset", "a{2}", "b", "c{2}", "d"}, Command::fmtOK()},
-    {{"mset", "a{1}", "b", "c{1}", "d"}, "-MOVED 9842 127.0.0.1:15001\r\n"},
-    {{"mget", "a{1}", "c{2}"},
-     "-CROSSSLOT Keys in request don't hash to the same slot\r\n"},
-    {{"exists", "a{1}", "c{2}"},
-     "-CROSSSLOT Keys in request don't hash to the same slot\r\n"},
-    {{"exists", "a{2}", "c{2}"}, ":2\r\n"},
-    {{"rename", "a{1}", "d{2}"},
-     "-CROSSSLOT Keys in request don't hash to the same slot\r\n"},
-    {{"rename", "a{2}", "d{2}"}, Command::fmtOK()},
+    // set is/isn't on my node
+    {{"set", "a{1}", "b"}, slotMovedReply},
+    {{"set", "a{2}", "b1"}, Command::fmtOK()},
+
+    // mset
+    // keys in 1 slot on my node
+    {{"mset", "a{2}", "b", "c{2}", "d", "e{2}", "f"}, Command::fmtOK()},
+    // keys in 1 slot but not on my node
+    {{"mset", "a{1}", "b", "c{1}", "d", "e{1}", "f"}, slotMovedReply},
+    // keys in >1 slots all on my node
+    {{"mset", "a{2}", "b", "c{3}", "d", "e{3}", "f"}, crossSlotReply},
+    // keys in >1 slots not all on my node
+    {{"mset", "a{2}", "b", "c{1}", "d", "e{1}", "f"}, crossSlotReply},
+    // keys in >1 slots all not on my node
+    {{"mset", "a{1}", "b", "c{4}", "d", "e{4}", "f"}, crossSlotReply},
+
+    // del
+    // keys in 1 slot on my node
+    {{"del", "a{2}", "c{2}", "e{2}"}, ":3\r\n"},
+    // keys in 1 slot but not on my node
+    {{"del", "a{1}", "c{1}", "e{1}"}, slotMovedReply},
+    // keys in >1 slots all on my node
+    {{"del", "a{2}", "c{3}", "e{3}"}, crossSlotReply},
+    // keys in >1 slots not all on my node
+    {{"del", "a{2}", "c{1}", "e{1}"}, crossSlotReply},
+    // keys in >1 slots all not on my node
+    {{"del", "a{1}", "c{4}", "e{4}"}, crossSlotReply},
+
+    // msetnx, set all key if and only if all keys not exist.
+    // keys in 1 slot on my node
+    {{"msetnx", "a{2}", "b", "c{2}", "d", "e{2}", "f"}, ":1\r\n"},
+    // keys in 1 slot but not on my node
+    {{"msetnx", "a{1}", "b", "c{1}", "d", "e{1}", "f"}, slotMovedReply},
+    // keys in >1 slots all on my node
+    {{"msetnx", "a{2}", "b", "c{3}", "d", "e{3}", "f"}, crossSlotReply},
+    // keys in >1 slots not all on my node
+    {{"msetnx", "a{2}", "b", "c{1}", "d", "e{1}", "f"}, crossSlotReply},
+    // keys in >1 slots all not on my node
+    {{"msetnx", "a{1}", "b", "c{4}", "d", "e{4}", "f"}, crossSlotReply},
+
+    // mget
+    // keys in 1 slot on my node
+    {{"mget", "a{2}", "c{2}", "e{2}"},
+      "*3\r\n$1\r\nb\r\n$1\r\nd\r\n$1\r\nf\r\n"},
+    // keys in 1 slot but not on my node
+    {{"mget", "a{1}", "c{1}", "e{1}"}, slotMovedReply},
+    // keys in >1 slots all on my node
+    {{"mget", "a{2}", "c{3}", "e{3}"}, crossSlotReply},
+    // keys in >1 slots not all on my node
+    {{"mget", "a{2}", "c{1}", "e{1}"}, crossSlotReply},
+    // keys in >1 slots all not on my node
+    {{"mget", "a{1}", "c{4}", "e{4}"}, crossSlotReply},
+
+    // exists
+    // keys in 1 slot on my node
+    {{"exists", "a{2}", "c{2}", "e{2}"}, ":3\r\n"},
+    // keys in 1 slot but not on my node
+    {{"exists", "a{1}", "c{1}", "e{1}"}, slotMovedReply},
+    // keys in >1 slots all on my node
+    {{"exists", "a{2}", "c{3}", "e{3}"}, crossSlotReply},
+    // keys in >1 slots not all on my node
+    {{"exists", "a{2}", "c{1}", "e{1}"}, crossSlotReply},
+    // keys in >1 slots all not on my node
+    {{"exists", "a{1}", "c{4}", "e{4}"}, crossSlotReply},
+
+    // unlink
+    // keys in 1 slot on my node
+    {{"unlink", "a{2}", "c{2}", "e{2}"}, ":3\r\n"},
+    // keys in 1 slot but not on my node
+    {{"unlink", "a{1}", "c{1}", "e{1}"}, slotMovedReply},
+    // keys in >1 slots all on my node
+    {{"unlink", "a{2}", "c{3}", "e{3}"}, crossSlotReply},
+    // keys in >1 slots not all on my node
+    {{"unlink", "a{2}", "c{1}", "e{1}"}, crossSlotReply},
+    // keys in >1 slots all not on my node
+    {{"unlink", "a{1}", "c{4}", "e{4}"}, crossSlotReply},
+
+    {{"rename", "a{1}", "d{2}"}, crossSlotReply},
+    {{"set", "a1{2}", "c"}, Command::fmtOK()},
+    {{"rename", "a1{2}", "d{2}"}, Command::fmtOK()},
     {{"sadd", "s1{2}", "1", "2", "3"}, ":3\r\n"},
-    {{"smove", "s1{2}", "s2{1}", "1"},
-     "-CROSSSLOT Keys in request don't hash to the same slot\r\n"},
+    {{"smove", "s1{2}", "s2{1}", "1"}, crossSlotReply},
     {{"smove", "s1{2}", "s2{2}", "1"}, ":1\r\n"},
   };
 
   testCommandArrayResult(server, resultArr);
+
+  // allow cross slot cases
+  // only case: 'keys in >1 slots all on my node' should be different with
+  // cases above.
+  std::vector<std::pair<std::vector<std::string>, std::string>> resultArr1 = {
+    {{"config", "set", "allow-cross-slot", "true"}, Command::fmtOK()},
+
+    // set is/isn't on my node
+    {{"set", "a{1}", "b"}, slotMovedReply},
+    {{"set", "a{2}", "b1"}, Command::fmtOK()},
+
+    // mset
+    // keys in 1 slot on my node
+    {{"mset", "a{2}", "b", "c{2}", "d", "e{2}", "f"}, Command::fmtOK()},
+    // keys in 1 slot but not on my node
+    {{"mset", "a{1}", "b", "c{1}", "d", "e{1}", "f"}, slotMovedReply},
+    // keys in >1 slots all on my node
+    {{"mset", "a{2}", "b", "c{3}", "d", "e{3}", "f"}, Command::fmtOK()},
+    // keys in >1 slots not all on my node
+    {{"mset", "a{2}", "b", "c{1}", "d", "e{1}", "f"}, crossSlotReply},
+    // keys in >1 slots all not on my node
+    {{"mset", "a{1}", "b", "c{4}", "d", "e{4}", "f"}, slotMovedReply1},
+
+    // del
+    // keys in 1 slot on my node
+    {{"del", "a{2}", "c{2}", "e{2}"}, ":3\r\n"},
+    // keys in 1 slot but not on my node
+    {{"del", "a{1}", "c{1}", "e{1}"}, slotMovedReply},
+    // keys in >1 slots all on my node
+    {{"set", "a{2}", "c"}, Command::fmtOK()},
+    {{"del", "a{2}", "c{3}", "e{3}"}, ":3\r\n"},
+    // keys in >1 slots not all on my node
+    {{"del", "a{2}", "c{1}", "e{1}"}, crossSlotReply},
+    // keys in >1 slots all not on my node
+    {{"del", "a{1}", "c{4}", "e{4}"}, slotMovedReply1},
+
+    // msetnx, set all key if and only if all keys not exist.
+    // keys in 1 slot on my node
+    {{"msetnx", "a{2}", "b", "c{2}", "d", "e{2}", "f"}, ":1\r\n"},
+    // keys in 1 slot but not on my node
+    {{"msetnx", "a{1}", "b", "c{1}", "d", "e{1}", "f"}, slotMovedReply},
+    // keys in >1 slots all on my node
+    {{"msetnx", "a{2}", "b", "c{3}", "d", "e{3}", "f"}, crossSlotReply},
+    // keys in >1 slots not all on my node
+    {{"msetnx", "a{2}", "b", "c{1}", "d", "e{1}", "f"}, crossSlotReply},
+    // keys in >1 slots all not on my node
+    {{"msetnx", "a{1}", "b", "c{4}", "d", "e{4}", "f"}, crossSlotReply},
+
+    // mget
+    // keys in 1 slot on my node
+    {{"mget", "a{2}", "c{2}", "e{2}"},
+      "*3\r\n$1\r\nb\r\n$1\r\nd\r\n$1\r\nf\r\n"},
+    // keys in 1 slot but not on my node
+    {{"mget", "a{1}", "c{1}", "e{1}"}, slotMovedReply},
+    // keys in >1 slots all on my node
+    {{"mset", "c{3}", "d", "e{3}", "f"}, Command::fmtOK()},
+    {{"mget", "a{2}", "c{3}", "e{3}"},
+      "*3\r\n$1\r\nb\r\n$1\r\nd\r\n$1\r\nf\r\n"},
+    // keys in >1 slots not all on my node
+    {{"mget", "a{2}", "c{1}", "e{1}"}, crossSlotReply},
+    // keys in >1 slots all not on my node
+    {{"mget", "a{1}", "c{4}", "e{4}"}, slotMovedReply1},
+
+    // exists
+    // keys in 1 slot on my node
+    {{"exists", "a{2}", "c{2}", "e{2}"}, ":3\r\n"},
+    // keys in 1 slot but not on my node
+    {{"exists", "a{1}", "c{1}", "e{1}"}, slotMovedReply},
+    // keys in >1 slots all on my node
+    {{"exists", "a{2}", "c{3}", "e{3}"}, ":3\r\n"},
+    // keys in >1 slots not all on my node
+    {{"exists", "a{2}", "c{1}", "e{1}"}, crossSlotReply},
+    // keys in >1 slots all not on my node
+    {{"exists", "a{1}", "c{4}", "e{4}"}, slotMovedReply1},
+
+    // unlink
+    // keys in 1 slot on my node
+    {{"unlink", "a{2}", "c{2}", "e{2}"}, ":3\r\n"},
+    // keys in 1 slot but not on my node
+    {{"unlink", "a{1}", "c{1}", "e{1}"}, slotMovedReply},
+    // keys in >1 slots all on my node
+    {{"set", "a{2}", "c"}, Command::fmtOK()},
+    {{"unlink", "a{2}", "c{3}", "e{3}"}, ":3\r\n"},
+    // keys in >1 slots not all on my node
+    {{"unlink", "a{2}", "c{1}", "e{1}"}, crossSlotReply},
+    // keys in >1 slots all not on my node
+    {{"unlink", "a{1}", "c{4}", "e{4}"}, slotMovedReply1},
+
+    {{"rename", "a{1}", "d{2}"}, crossSlotReply},
+    {{"set", "a3{2}", "c"}, Command::fmtOK()},
+    {{"rename", "a3{2}", "d{2}"}, Command::fmtOK()},
+    {{"sadd", "s3{2}", "1", "2", "3"}, ":3\r\n"},
+    {{"smove", "s3{2}", "s4{1}", "1"}, crossSlotReply},
+    {{"smove", "s3{2}", "s4{2}", "1"}, ":1\r\n"},
+  };
+  testCommandArrayResult(server, resultArr1);
 
   // readonly, readwrite
   auto serverMaster = servers[1];
@@ -3077,6 +3293,107 @@ TEST(Cluster, failoverNeedFullSyncDone) {
   servers.clear();
 }
 
+
+TEST(Cluster, bindZeroAddr) {
+  uint32_t nodeNum = 3;
+  uint32_t startPort = 15500;
+  bool withSlave = true;
+
+  const auto guard = MakeGuard([&nodeNum, &withSlave] {
+    if (withSlave) {
+      destroyCluster(nodeNum * 2);
+    } else {
+      destroyCluster(nodeNum);
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+  });
+
+  auto servers = makeCluster(startPort, nodeNum, 10, withSlave);
+  // server[0] is master of server[3]
+  auto master = servers[0];
+  auto slave = servers[3];
+
+  auto node = servers[1];
+  auto masterName = master->getClusterMgr()->getClusterState()->getMyselfName();
+
+  auto state = node->getClusterMgr()->getClusterState();
+
+  auto slaveName = slave->getClusterMgr()->getClusterState()->getMyselfName();
+
+  // kill master & slave , and restart it ust bind 0.0.0.0
+  master->stop();
+  slave->stop();
+
+  // restart  master
+  auto cfg1 = makeServerParam(startPort, 10, "node" + to_string(0), true);
+  cfg1->clusterEnabled = true;
+  cfg1->pauseTimeIndexMgr = 1;
+  cfg1->rocksBlockcacheMB = 24;
+  cfg1->clusterSingleNode = false;
+  cfg1->bindIp = "0.0.0.0";
+  master = std::make_shared<ServerEntry>(cfg1);
+  auto s1 = master->startup(cfg1);
+  INVARIANT(s1.ok());
+  std::this_thread::sleep_for(std::chrono::seconds(5));
+  // restart slave
+  auto cfg2 = makeServerParam(startPort + 3, 10, "node" + to_string(3), true);
+  cfg2->clusterEnabled = true;
+  cfg2->pauseTimeIndexMgr = 1;
+  cfg2->rocksBlockcacheMB = 24;
+  cfg2->clusterSingleNode = false;
+  cfg2->bindIp = "0.0.0.0";
+  slave = std::make_shared<ServerEntry>(cfg2);
+  auto s2 = slave->startup(cfg2);
+  INVARIANT(s2.ok());
+  std::this_thread::sleep_for(std::chrono::seconds(5));
+  EXPECT_TRUE(nodeIsMySlave(master, slave));
+
+  auto ctx1 = std::make_shared<asio::io_context>();
+  auto sess1 = makeSession(master, ctx1);
+  WorkLoad work1(master, sess1);
+  work1.init();
+
+  auto ctx2 = std::make_shared<asio::io_context>();
+  auto sess2 = makeSession(slave, ctx2);
+  WorkLoad work2(slave, sess2);
+  work2.init();
+
+  std::string ret1 = work1.getStringResult({"info", "replication"});
+  // info should not contain 0.0.0.0
+  EXPECT_TRUE(ret1.find("0.0.0.0") == string::npos);
+  EXPECT_TRUE(ret1.find("role:master") != string::npos);
+
+  auto ret2 = work2.getStringResult({"info", "replication"});
+  EXPECT_TRUE(ret2.find("0.0.0.0") == string::npos);
+  EXPECT_TRUE(ret2.find("role:slave") != string::npos);
+
+  work2.manualFailover();
+  std::this_thread::sleep_for(10s);
+
+  ret1 = work1.getStringResult({"info", "replication"});
+  EXPECT_TRUE(ret1.find("0.0.0.0") == string::npos);
+  // master become slave
+  EXPECT_TRUE(ret1.find("role:slave") != string::npos);
+
+  ret2 = work2.getStringResult({"info", "replication"});
+  EXPECT_TRUE(ret2.find("0.0.0.0") == string::npos);
+  // slave become master
+  EXPECT_TRUE(ret2.find("role:master") != string::npos);
+
+#ifndef _WIN32
+  for (auto svr : servers) {
+    svr->stop();
+    LOG(INFO) << "stop " << svr->getParams()->port << " success";
+  }
+  master->stop();
+  slave->stop();
+#endif
+  servers.emplace_back(std::move(master));
+  servers.emplace_back(std::move(slave));
+  servers.clear();
+}
+
+
 TEST(Cluster, failoverConfilct) {
   uint32_t nodeNum = 3;
   uint32_t startPort = 15200;
@@ -3106,9 +3423,9 @@ TEST(Cluster, failoverConfilct) {
 
   // for support MOVED
   string srcAddr =
-      node1->getParams()->bindIp + ":" + to_string(node1->getParams()->port);
+    node1->getParams()->bindIp + ":" + to_string(node1->getParams()->port);
   string dstAddr =
-       node2->getParams()->bindIp + ":" + to_string(node2->getParams()->port);
+    node2->getParams()->bindIp + ":" + to_string(node2->getParams()->port);
   work1.addClusterSession(srcAddr, sess1);
   work1.addClusterSession(dstAddr, sess2);
   work2.addClusterSession(srcAddr, sess1);
@@ -3120,8 +3437,8 @@ TEST(Cluster, failoverConfilct) {
     string key = getUUid(8) + "{11}";
     string value = getUUid(10);
     auto ret = work1.getStringResult({"set", key, value});
-    if (j == numData/2) {
-        work2.manualFailover();
+    if (j == numData / 2) {
+      work2.manualFailover();
     }
     EXPECT_EQ(ret, "+OK\r\n");
   }

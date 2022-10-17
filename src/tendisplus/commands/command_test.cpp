@@ -22,6 +22,7 @@
 #include "tendisplus/server/server_entry.h"
 #include "tendisplus/utils/string.h"
 #include "tendisplus/utils/invariant.h"
+#include "rocksdb/utilities/table_properties_collectors.h"
 
 namespace tendisplus {
 
@@ -164,9 +165,9 @@ TEST(Command, expire) {
   auto cfg = makeServerParam();
   auto server = makeServerEntry(cfg);
 
-  testExpire(server);
-  testExpire1(server);
-  testExpire2(server);
+  testExpireForImmediately(server);
+  testExpireForAlreadyExpired1(server);
+  testExpireForAlreadyExpired2(server);
   testExpireCommandWhenNoexpireTrue(server);
   testExpireKeyWhenGet(server);
   testExpireKeyWhenCompaction(server);
@@ -2189,16 +2190,44 @@ void testRocksOptionCommand(std::shared_ptr<ServerEntry> svr) {
   asio::ip::tcp::socket socket(ioContext);
   NetSession sess(svr, std::move(socket), 1, false, nullptr, nullptr);
 
-  sess.setArgs({"CONFIG", "SET", "rocks.max_background_compactions", "3"});
+  std::stringstream ss;
+
+  sess.setArgs({"CONFIG", "GET", "rocks.max_background_jobs"});
   auto expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  Command::fmtMultiBulkLen(ss, 2);
+  Command::fmtBulk(ss, "rocks.max_background_jobs");
+  Command::fmtBulk(ss, "2");
+  EXPECT_EQ(ss.str(), expect.value());
+
+  sess.setArgs({"CONFIG", "SET", "rocks.max_background_jobs", "3"});
+  expect = Command::runSessionCmd(&sess);
   EXPECT_TRUE(expect.ok());
   for (uint32_t i = 0; i < svr->getKVStoreCount(); i++) {
     auto exptDb = svr->getSegmentMgr()->getDb(&sess, 0, mgl::LockMode::LOCK_IS);
     EXPECT_TRUE(exptDb.ok());
 
     auto store = exptDb.value().store;
-    EXPECT_EQ(store->getOption("rocks.max_background_compactions"), 3);
+    EXPECT_EQ(store->getOption("rocks.max_background_jobs"), 3);
   }
+
+  sess.setArgs({"CONFIG", "GET", "rocks.max_background_jobs"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  ss.str("");
+  Command::fmtMultiBulkLen(ss, 2);
+  Command::fmtBulk(ss, "rocks.max_background_jobs");
+  Command::fmtBulk(ss, "3");
+  EXPECT_EQ(ss.str(), expect.value());
+
+  sess.setArgs({"CONFIG", "GET", "rocks.max_open_files"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  ss.str("");
+  Command::fmtMultiBulkLen(ss, 2);
+  Command::fmtBulk(ss, "rocks.max_open_files");
+  Command::fmtBulk(ss, "-1");
+  EXPECT_EQ(ss.str(), expect.value());
 
   sess.setArgs({"CONFIG", "SET", "rocks.max_open_files", "3000"});
   expect = Command::runSessionCmd(&sess);
@@ -2211,7 +2240,16 @@ void testRocksOptionCommand(std::shared_ptr<ServerEntry> svr) {
     EXPECT_EQ(store->getOption("rocks.max_open_files"), 3000);
   }
 
-  sess.setArgs({"CONFIG", "SET", "rocks.max_open_files", "-1"});
+  sess.setArgs({"CONFIG", "GET", "rocks.max_open_files"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  ss.str("");
+  Command::fmtMultiBulkLen(ss, 2);
+  Command::fmtBulk(ss, "rocks.max_open_files");
+  Command::fmtBulk(ss, "3000");
+  EXPECT_EQ(ss.str(), expect.value());
+
+  sess.setArgs({ "CONFIG", "SET", "rocks.max_open_files", "-1" });
   expect = Command::runSessionCmd(&sess);
   EXPECT_TRUE(expect.ok());
   for (uint32_t i = 0; i < svr->getKVStoreCount(); i++) {
@@ -2221,6 +2259,82 @@ void testRocksOptionCommand(std::shared_ptr<ServerEntry> svr) {
     auto store = exptDb.value().store;
     EXPECT_EQ(store->getOption("rocks.max_open_files"), -1);
   }
+
+  sess.setArgs({ "CONFIG", "GET", "rocks.max_open_files" });
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  ss.str("");
+  Command::fmtMultiBulkLen(ss, 2);
+  Command::fmtBulk(ss, "rocks.max_open_files");
+  Command::fmtBulk(ss, "-1");
+  EXPECT_EQ(ss.str(), expect.value());
+
+  // we will adjust these tests when we use rocksdb(version > 6.11)
+  std::string err;
+  sess.setArgs({"CONFIG", "SET", "rocks.compaction_deletes_window", "100"});
+  expect = Command::runSessionCmd(&sess);
+#if ROCKSDB_MAJOR > 6 || (ROCKSDB_MAJOR == 6 && ROCKSDB_MINOR > 11)
+  EXPECT_TRUE(expect.ok());
+#else
+  EXPECT_FALSE(expect.ok());
+  err = Command::fmtErr(
+    "-ERR:3,msg:rocks.compaction_deletes_window can't be changed dynmaically "
+    "in rocksdb(version < 6.11)\r\n");
+  EXPECT_EQ(err, expect.status().toString());
+#endif
+
+  sess.setArgs({"CONFIG", "SET", "rocks.compaction_deletes_trigger", "50"});
+  expect = Command::runSessionCmd(&sess);
+#if ROCKSDB_MAJOR > 6 || (ROCKSDB_MAJOR == 6 && ROCKSDB_MINOR > 11)
+  EXPECT_TRUE(expect.ok());
+#else
+  EXPECT_FALSE(expect.ok());
+  err.clear();
+  err = Command::fmtErr(
+    "-ERR:3,msg:rocks.compaction_deletes_trigger can't be changed dynmaically "
+    "in rocksdb(version < 6.11)\r\n");
+  EXPECT_EQ(err, expect.status().toString());
+#endif
+
+  sess.setArgs({"CONFIG", "SET", "rocks.compaction_deletes_ratio", "0.5"});
+  expect = Command::runSessionCmd(&sess);
+#if ROCKSDB_MAJOR > 6 || (ROCKSDB_MAJOR == 6 && ROCKSDB_MINOR > 11)
+  EXPECT_TRUE(expect.ok());
+#else
+  EXPECT_FALSE(expect.ok());
+  err.clear();
+  err = Command::fmtErr(
+    "-ERR:3,msg:rocks.compaction_deletes_ratio can't be changed dynmaically "
+    "in rocksdb(version < 6.11)\r\n");
+  EXPECT_EQ(err, expect.status().toString());
+#endif
+
+#if ROCKSDB_MAJOR > 6 || (ROCKSDB_MAJOR == 6 && ROCKSDB_MINOR > 11)
+  std::ostringstream tableProperties;
+  tableProperties << "CompactOnDeletionCollector"
+                  << " (Sliding window size = " << 100
+                  << " Deletion trigger = " << 50 << " Deletion ratio = " << 0.5
+                  << ')';
+  for (uint32_t i = 0; i < svr->getKVStoreCount(); i++) {
+    auto exptDb = svr->getSegmentMgr()->getDb(&sess, 0, mgl::LockMode::LOCK_IS);
+    EXPECT_TRUE(exptDb.ok());
+
+    auto store = exptDb.value().store;
+    auto rocksStore = static_cast<tendisplus::RocksKVStore*>(store.get());
+    auto tableFactory = rocksStore->getUnderlayerPesDB()
+                          ->GetOptions()
+                          .table_properties_collector_factories;
+    for (auto factory : tableFactory) {
+      if (std::string(factory->Name()) == "CompactOnDeletionCollector") {
+        auto compactOnDel =
+          static_cast<rocksdb::CompactOnDeletionCollectorFactory*>(
+            factory.get());
+        EXPECT_EQ(tableProperties.str(), compactOnDel->ToString());
+        break;
+      }
+    }
+  }
+#endif
 
   sess.setArgs({"CONFIG", "SET", "rocks.abc", "-1"});
   expect = Command::runSessionCmd(&sess);
@@ -2525,6 +2639,109 @@ void testSort(bool clusterEnabled) {
               "-ERR GET option of SORT denied in Cluster mode.\r\n");
   }
 
+  // sort get nil
+  sess.setArgs({"sort", "uid", "get", "user_name_*", "get", "_:*"});
+  expect = Command::runSessionCmd(&sess);
+  if (!clusterEnabled) {
+    EXPECT_EQ(expect.value(),
+              "*6\r\n$5\r\nadmin\r\n$-1\r\n$4\r\njack\r\n"
+              "$-1\r\n$4\r\nmary\r\n$-1\r\n");
+  } else {
+    EXPECT_EQ(expect.status().toString(),
+              "-ERR GET option of SORT denied in Cluster mode.\r\n");
+  }
+
+  sess.setArgs({"LPUSH", "{a}list1", "2", "3", ""});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+
+  // sort get *
+  sess.setArgs({"sort", "{a}list1", "alpha", "get", "*"});
+  expect = Command::runSessionCmd(&sess);
+  if (!clusterEnabled) {
+    // nil, nil, nil
+    EXPECT_EQ(expect.value(),
+              "*3\r\n$-1\r\n$-1\r\n$-1\r\n");
+  } else {
+    EXPECT_EQ(expect.status().toString(),
+              "-ERR GET option of SORT denied in Cluster mode.\r\n");
+  }
+
+  // sort get #
+  sess.setArgs({"sort", "{a}list1", "alpha", "get", "#"});
+  expect = Command::runSessionCmd(&sess);
+  if (!clusterEnabled) {
+    // "", 2, 3
+    EXPECT_EQ(expect.value(),
+              "*3\r\n$0\r\n\r\n$1\r\n2\r\n$1\r\n3\r\n");
+  } else {
+    EXPECT_EQ(expect.status().toString(),
+              "-ERR GET option of SORT denied in Cluster mode.\r\n");
+  }
+
+  // sort store, cross slot
+  sess.setArgs({"sort", "{a}list1", "alpha", "store", "list1"});
+  expect = Command::runSessionCmd(&sess);
+  if (!clusterEnabled) {
+    EXPECT_TRUE(expect.ok());
+    EXPECT_EQ(expect.value(),
+              ":3\r\n");
+  } else {
+    EXPECT_EQ(expect.status().toString(),
+              "-CROSSSLOT Keys in request don't hash to the same slot\r\n");
+  }
+
+  // sort store, contain ""
+  sess.setArgs({"sort", "{a}list1", "alpha", "store", "{a}list2"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  EXPECT_EQ(expect.value(),
+            ":3\r\n");
+
+  sess.setArgs({"lrange", "{a}list2", "0", "-1"});
+  expect = Command::runSessionCmd(&sess);
+  // "", 2, 3
+  EXPECT_EQ(expect.value(),
+          "*3\r\n$0\r\n\r\n$1\r\n2\r\n$1\r\n3\r\n");
+
+  // sort store, contain nil
+  sess.setArgs({"sort", "{a}list1", "alpha", "get", "*", "store", "{a}list3"});
+  expect = Command::runSessionCmd(&sess);
+  if (!clusterEnabled) {
+    EXPECT_TRUE(expect.ok());
+    EXPECT_EQ(expect.value(),
+              ":3\r\n");
+  } else {
+    EXPECT_EQ(expect.status().toString(),
+              "-ERR GET option of SORT denied in Cluster mode.\r\n");
+  }
+  sess.setArgs({"lrange", "{a}list3", "0", "-1"});
+  expect = Command::runSessionCmd(&sess);
+  if (!clusterEnabled) {
+    // sort store: nil will be changed to ""
+    // "", "", ""
+    EXPECT_EQ(expect.value(),
+              "*3\r\n$0\r\n\r\n$0\r\n\r\n$0\r\n\r\n");
+  } else {
+    EXPECT_EQ(expect.value(),
+              "*0\r\n");
+  }
+
+  sess.setArgs({"set", "2", "b"});
+  expect = Command::runSessionCmd(&sess);
+  EXPECT_TRUE(expect.ok());
+  // sort get *, need return value:b of key:2
+  sess.setArgs({"sort", "{a}list1", "alpha", "get", "*"});
+  expect = Command::runSessionCmd(&sess);
+  if (!clusterEnabled) {
+    EXPECT_TRUE(expect.ok());
+    EXPECT_EQ(expect.value(),
+              "*3\r\n$-1\r\n$1\r\nb\r\n$-1\r\n");
+  } else {
+    EXPECT_EQ(expect.status().toString(),
+              "-ERR GET option of SORT denied in Cluster mode.\r\n");
+  }
+
 #ifndef _WIN32
   server->stop();
   EXPECT_EQ(server.use_count(), 1);
@@ -2579,6 +2796,44 @@ TEST(Command, testDbsizeAndFlushall) {
 
   thd1.join();
   thd2.join();
+
+  remove(cfg->getConfFile().c_str());
+
+#ifndef _WIN32
+  server->stop();
+  EXPECT_EQ(server.use_count(), 1);
+#endif
+}
+
+// flushall with WalDir different with DBPath
+TEST(Command, testFlushallWithRocksDBPath) {
+  std::string walPath = "./wal";
+  std::error_code ec;
+
+  const auto guard = MakeGuard([&walPath, &ec] {
+    destroyEnv();
+    filesystem::remove_all(walPath, ec);
+  });
+
+  EXPECT_TRUE(setupEnv());
+  EXPECT_TRUE(filesystem::create_directory(walPath));
+
+  auto cfg = makeServerParam();
+  cfg->rocksWALDir = walPath;
+  auto server = makeServerEntry(cfg);
+
+  testCommand(server);
+
+  {
+    asio::io_context ioContext;
+    asio::ip::tcp::socket socket(ioContext), socket1(ioContext);
+    NetSession sess(server, std::move(socket), 1, false, nullptr, nullptr);
+
+    sess.setArgs({"flushall"});
+    auto expect = Command::runSessionCmd(&sess);
+    EXPECT_TRUE(expect.ok());
+    EXPECT_EQ("+OK\r\n", expect.value());
+  }
 
   remove(cfg->getConfFile().c_str());
 

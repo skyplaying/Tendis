@@ -356,6 +356,9 @@ class KVStore {
   const std::string& dbId() const {
     return _id;
   }
+  const std::string dbName() const {
+    return _dbPath + "/" + _id;
+  }
   const std::string dftBackupDir() const {
     return _backupDir;
   }
@@ -461,6 +464,8 @@ class KVStore {
   void setBinlogTime(uint64_t timestamp);
   uint64_t getCurrentTime();
   virtual Status setOption(const std::string& option, int64_t value) = 0;
+  virtual Status setCompactOnDeletionCollectorFactory(
+    const std::string& option, const std::string& value) = 0;
   virtual int64_t getOption(const std::string& option) = 0;
 
   KVStoreStat stat;
